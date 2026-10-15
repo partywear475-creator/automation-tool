@@ -48,6 +48,8 @@ export default async function Dashboard() {
       <h1>Automation Tool</h1>
       <p className="sub">
         {workflows.length} workflows migrated from n8n · {scheduled.length} scheduled · {onDemand.length} on-demand
+        {" · "}
+        <a href="/trigger">Run a workflow →</a>
       </p>
 
       <h2>Recent runs</h2>
