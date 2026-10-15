@@ -1,12 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
-    { "path": "/api/cron/cocogrove-storytelling-carousel", "schedule": "0 8 * * *" },
     { "path": "/api/cron/cocogrove-daily-sales-report", "schedule": "0 7 * * *" },
-    { "path": "/api/cron/cocogrove-instagram-performance-report", "schedule": "0 7 * * 1" },
-    { "path": "/api/cron/tixuy-instagram-auto-post-carousel", "schedule": "0 8 * * *" },
-    { "path": "/api/cron/nianova-daily-tiktok-brief", "schedule": "0 8 * * *" },
-    { "path": "/api/cron/shared-instagram-performance-report", "schedule": "0 7 * * 1" },
-    { "path": "/api/cron/shared-instagram-competitor-trend-tracker", "schedule": "0 7 * * 3" }
+    { "path": "/api/cron/cocogrove-storytelling-carousel", "schedule": "0 8 * * *" }
   ]
 }
