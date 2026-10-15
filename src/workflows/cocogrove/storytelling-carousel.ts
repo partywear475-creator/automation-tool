@@ -1,5 +1,5 @@
 import sharp from "sharp";
-import { defineWorkflow } from "../types";
+import { defineWorkflow, type WorkflowContext, type WorkflowResult } from "../types";
 import { env } from "@/lib/env";
 import { httpJson, sleep } from "@/lib/http";
 import {
@@ -10,6 +10,35 @@ import {
 import { cloudinaryJpeg } from "@/lib/cloudinary";
 import { generateImage, generateJson } from "@/lib/openai";
 import { sendEmail } from "@/lib/email";
+import { getState, setState } from "@/lib/logger";
+
+/**
+ * REVIEW GATE
+ * -----------
+ * This workflow runs in two modes (ctx.input.mode):
+ *   - "generate" (default, and what the daily schedule does): writes the story,
+ *     renders the 5 slide images, uploads them to Cloudinary, saves the draft,
+ *     and emails a preview. It does NOT post anything to Instagram.
+ *   - "publish": takes the last saved draft and actually publishes it to
+ *     CocoGrove's Instagram. Only ever run after a human has reviewed the draft.
+ * So nothing reaches the live CocoGrove account without an explicit approval.
+ */
+const WORKFLOW_ID = "cocogrove-storytelling-carousel";
+const DRAFT_KEY = "pending-carousel";
+
+// The Facebook Page that CocoGrove's Instagram is connected to. The IG Business
+// account id is resolved from this Page at run time (env can override the Page).
+const COCOGROVE_FB_PAGE_ID = process.env.FB_COCOGROVE_PAGE_ID || "1051785127762602";
+
+interface CarouselDraft {
+  topic: string;
+  caption: string;
+  hashtags: string;
+  imageUrls: string[];
+  slideCaptions: string[];
+  igUsername: string;
+  generatedAt: string;
+}
 
 /**
  * Faithful port of n8n "CocoGrove Storytelling Carousel" (9Pdt1dsLYfaAWmVu).
@@ -42,9 +71,6 @@ import { sendEmail } from "@/lib/email";
  * ImageMagick's default font was used in n8n (unspecified); a serif is used here.
  */
 
-// CocoGrove IG Business Account ID (from the Facebook Graph nodes).
-const COCOGROVE_IG_USER_ID = "17841461430625142";
-
 // n8n Gmail recipient for this workflow (Send Success Email / Send Failure Alert).
 const REPORT_RECIPIENT = env.reportTo() || "shibile504@gmail.com";
 
@@ -73,16 +99,56 @@ interface FacebookPage {
   access_token: string;
 }
 
-/** Faithful "Select CocoGrove Page": name includes "cocogrove", else first page. */
-async function selectCocogrovePage(): Promise<FacebookPage> {
+interface ResolvedAccount {
+  igUserId: string;
+  username: string;
+  pageToken: string;
+  pageName: string;
+  pageId: string;
+}
+
+/**
+ * Resolve CocoGrove's Instagram Business account from its Facebook Page.
+ * Finds the Page (by id COCOGROVE_FB_PAGE_ID, falling back to a name match),
+ * then reads instagram_business_account{id,username} from it. An env override
+ * (IG_COCOGROVE_BUSINESS_ACCOUNT_ID) still wins if set.
+ */
+async function resolveCocogroveAccount(): Promise<ResolvedAccount> {
   const url = `${GRAPH()}/me/accounts?fields=id,name,access_token&access_token=${env.igAccessToken()}`;
   const body = await httpJson<{ data: FacebookPage[] }>(url);
   const items = body.data || [];
   if (!items.length) {
-    throw new Error("No Facebook Pages found on this CocoGrove Facebook Graph credential.");
+    throw new Error("No Facebook Pages found on this access token.");
   }
-  const match = items.find((p) => (p.name || "").toLowerCase().includes("cocogrove"));
-  return match || items[0];
+  let page = items.find((p) => p.id === COCOGROVE_FB_PAGE_ID);
+  if (!page) page = items.find((p) => (p.name || "").toLowerCase().includes("cocogrove"));
+  if (!page) {
+    throw new Error(
+      `CocoGrove Facebook Page (${COCOGROVE_FB_PAGE_ID}) not found. Pages on this token: ` +
+        (items.map((p) => `${p.name} (${p.id})`).join(", ") || "none"),
+    );
+  }
+
+  const igUrl =
+    `${GRAPH()}/${page.id}?fields=instagram_business_account{id,username}` +
+    `&access_token=${page.access_token}`;
+  const igBody = await httpJson<{ instagram_business_account?: { id: string; username: string } }>(igUrl);
+  const ig = igBody.instagram_business_account;
+  const override = env.igAccountOptional("cocogrove");
+  const igUserId = override || ig?.id || "";
+  if (!igUserId) {
+    throw new Error(
+      `No Instagram Business account is linked to the CocoGrove Facebook Page (${page.id}). ` +
+        `Link the IG account in Meta Business settings, then retry.`,
+    );
+  }
+  return {
+    igUserId,
+    username: ig?.username || "(unknown)",
+    pageToken: page.access_token,
+    pageName: page.name,
+    pageId: page.id,
+  };
 }
 
 // --- Nostalgic caption overlay (faithful to the "Edit Image" node) -----------
@@ -171,113 +237,153 @@ export default defineWorkflow({
   description:
     "Daily 09:00 London storytelling carousel for CocoGrove's Instagram: gpt-5-mini writes a 5-slide photo-essay, gpt-image-1 renders each slide, a nostalgic caption band is composited on, then Cloudinary-upload + CAROUSEL publish, with success/failure alert emails.",
   trigger: "schedule",
-  schedule: "0 8 * * *", // Daily 09:00 Europe/London (BST = UTC+1)
+  schedule: "0 8 * * *", // Daily 09:00 Europe/London (BST = UTC+1) — runs GENERATE only
   enabled: true,
 
   async run(ctx) {
-    const igUserId = env.igAccountOptional("cocogrove") || COCOGROVE_IG_USER_ID;
-
-    // --- Get My Facebook Page -> Select CocoGrove Page ---
-    const page = await selectCocogrovePage();
-    const pageToken = page.access_token;
-    await ctx.log("page:selected", { pageId: page.id, name: page.name });
-
-    // --- Generate Story Content (agent, gpt-5-mini, structured JSON) ---
-    const output = await generateJson<StoryOutput>({
-      system: STORY_SYSTEM_MESSAGE,
-      prompt: STORY_USER_TEXT,
-      model: "gpt-5-mini",
-    });
-
-    // --- Prepare Story Content ---
-    const topic = output.topic;
-    const caption = output.caption;
-    const hashtags = Array.isArray(output.hashtags)
-      ? output.hashtags.join(" ")
-      : output.hashtags;
-    const slides = output.slides || [];
-    await ctx.log("story:prepared", { topic, slideCount: slides.length });
-
-    // --- Per slide: image -> overlay -> cloudinary -> carousel item container ---
-    const containerIds: string[] = [];
-    for (let i = 0; i < slides.length; i++) {
-      const slide = slides[i];
-      await ctx.log("slide:begin", { index: i + 1, of: slides.length, caption: slide.caption });
-
-      // Generate Slide Image (gpt-image-1, high quality, 1024x1024)
-      const png = await generateImage({
-        prompt: slide.imagePrompt,
-        size: "1024x1024",
-        quality: "high",
-      });
-
-      // Add Nostalgic Text Overlay (translucent band + caption text, no logo)
-      const overlaid = await addNostalgicTextOverlay(png, slide.caption);
-
-      // Upload Slide to Cloudinary -> f_jpg,q_auto URL
-      const imageUrl = await cloudinaryJpeg(overlaid);
-      await ctx.log("slide:cloudinary", { index: i + 1, imageUrl });
-
-      // Create Carousel Item Container
-      const id = await createCarouselItem(igUserId, imageUrl, pageToken);
-      containerIds.push(id);
-      await ctx.log("slide:container", { index: i + 1, containerId: id });
-    }
-
-    // Wait For Items Processing (10s)
-    await sleep(10_000);
-
-    // --- Create Carousel Container (caption + "\n\n" + hashtags) ---
-    const carouselCaption = `${caption}\n\n${hashtags}`;
-    const carouselId = await createCarouselContainer(igUserId, containerIds, carouselCaption, pageToken);
-    await ctx.log("carousel:created", { carouselId, children: containerIds.length });
-
-    // Wait For Carousel Processing (10s) -> Check Carousel Status
-    await sleep(10_000);
-    const statusCode = await checkContainerStatus(carouselId, pageToken);
-    await ctx.log("carousel:status", { statusCode });
-
-    // --- Carousel Ready? (status_code === "FINISHED") ---
-    if (statusCode !== "FINISHED") {
-      // Send Failure Alert
-      await sendEmail({
-        to: REPORT_RECIPIENT,
-        subject: "CocoGrove storytelling carousel failed — media container not ready",
-        html:
-          `<p>The CocoGrove Instagram carousel container did not finish processing in time.</p>` +
-          `<p><strong>Status:</strong> ${statusCode}</p>` +
-          `<p><strong>Container ID:</strong> ${carouselId}</p>` +
-          `<p>Open the Meta Graph API Explorer to check manually, or re-run this workflow — you may need to increase the Wait node delay.</p>`,
-      });
-      await ctx.log("carousel:failure-alert", { to: REPORT_RECIPIENT, statusCode });
-      return {
-        summary: `CocoGrove storytelling carousel NOT published — container status ${statusCode}`,
-        data: { topic, carouselId, statusCode, published: false },
-      };
-    }
-
-    // --- Publish Carousel -> Get Post Permalink ---
-    const mediaId = await publishContainer(igUserId, carouselId, pageToken);
-    const permalink = await getPermalink(mediaId, pageToken);
-    await ctx.log("carousel:published", { mediaId, permalink });
-
-    // --- Send Success Email ---
-    await sendEmail({
-      to: REPORT_RECIPIENT,
-      subject: `✅ CocoGrove storytelling carousel published: ${topic}`,
-      html:
-        `<h3>CocoGrove Instagram storytelling carousel published</h3>` +
-        `<p><strong>Topic:</strong> ${topic}</p>` +
-        `<p><strong>Caption:</strong><br>${caption}</p>` +
-        `<p><strong>Hashtags:</strong><br>${hashtags}</p>` +
-        `<p><strong>Slides:</strong> ${slides.length}</p>` +
-        `<p><strong>Post:</strong> <a href="${permalink}">${permalink}</a></p>`,
-    });
-    await ctx.log("email:sent", { to: REPORT_RECIPIENT });
-
-    return {
-      summary: `Published CocoGrove storytelling carousel (${slides.length} slides): ${topic}`,
-      data: { topic, mediaId, permalink, slides: slides.length, published: true },
-    };
+    const mode = String((ctx.input?.mode as string) || "generate").toLowerCase();
+    if (mode === "publish") return publishDraft(ctx);
+    return generateDraft(ctx);
   },
 });
+
+// --- GENERATE: write story, render slides, save draft, email preview. No posting. ---
+async function generateDraft(ctx: WorkflowContext): Promise<WorkflowResult> {
+  // Resolve the account up front so the preview can name which IG it will post to.
+  const acct = await resolveCocogroveAccount();
+  await ctx.log("account:resolved", {
+    pageId: acct.pageId,
+    pageName: acct.pageName,
+    igUserId: acct.igUserId,
+    igUsername: acct.username,
+  });
+
+  // --- Generate Story Content (agent, gpt-5-mini, structured JSON) ---
+  const output = await generateJson<StoryOutput>({
+    system: STORY_SYSTEM_MESSAGE,
+    prompt: STORY_USER_TEXT,
+    model: "gpt-5-mini",
+  });
+
+  const topic = output.topic;
+  const caption = output.caption;
+  const hashtags = Array.isArray(output.hashtags) ? output.hashtags.join(" ") : output.hashtags;
+  const slides = output.slides || [];
+  await ctx.log("story:prepared", { topic, slideCount: slides.length });
+
+  // --- Per slide: image -> overlay -> Cloudinary (no IG containers yet) ---
+  const imageUrls: string[] = [];
+  const slideCaptions: string[] = [];
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    await ctx.log("slide:begin", { index: i + 1, of: slides.length, caption: slide.caption });
+    const png = await generateImage({ prompt: slide.imagePrompt, size: "1024x1024", quality: "high" });
+    const overlaid = await addNostalgicTextOverlay(png, slide.caption);
+    const imageUrl = await cloudinaryJpeg(overlaid);
+    imageUrls.push(imageUrl);
+    slideCaptions.push(slide.caption);
+    await ctx.log("slide:cloudinary", { index: i + 1, imageUrl });
+  }
+
+  // --- Save the draft for review ---
+  const draft: CarouselDraft = {
+    topic,
+    caption,
+    hashtags,
+    imageUrls,
+    slideCaptions,
+    igUsername: acct.username,
+    generatedAt: new Date().toISOString(),
+  };
+  await setState(WORKFLOW_ID, DRAFT_KEY, draft);
+  await ctx.log("draft:saved", { topic, slides: imageUrls.length });
+
+  // --- Email a preview for approval ---
+  const imgs = imageUrls
+    .map((u, i) => `<p><strong>Slide ${i + 1}:</strong> ${slideCaptions[i]}<br><img src="${u}" width="320" style="border-radius:8px"/></p>`)
+    .join("");
+  await sendEmail({
+    to: REPORT_RECIPIENT,
+    subject: `📝 Review: CocoGrove carousel ready to approve — ${topic}`,
+    html:
+      `<h3>CocoGrove storytelling carousel — ready for your approval</h3>` +
+      `<p>This is a <strong>draft</strong>. Nothing has been posted. Review it below; if you're happy, approve it to publish to <strong>@${acct.username}</strong>.</p>` +
+      `<p><strong>Topic:</strong> ${topic}</p>` +
+      `<p><strong>Caption:</strong><br>${caption}</p>` +
+      `<p><strong>Hashtags:</strong><br>${hashtags}</p>` +
+      `<hr>${imgs}`,
+  });
+  await ctx.log("preview:emailed", { to: REPORT_RECIPIENT });
+
+  return {
+    summary: `Draft ready for review (${imageUrls.length} slides): ${topic} — approve to publish to @${acct.username}`,
+    data: { mode: "generate", topic, igUsername: acct.username, imageUrls, caption, hashtags, published: false },
+  };
+}
+
+// --- PUBLISH: take the saved draft and post it live. Only after human approval. ---
+async function publishDraft(ctx: WorkflowContext): Promise<WorkflowResult> {
+  const draft = await getState<CarouselDraft>(WORKFLOW_ID, DRAFT_KEY);
+  if (!draft || !draft.imageUrls?.length) {
+    throw new Error("No pending carousel to publish. Run it in generate mode first, review it, then approve.");
+  }
+  const acct = await resolveCocogroveAccount();
+  await ctx.log("account:resolved", { igUserId: acct.igUserId, igUsername: acct.username });
+
+  // Build fresh carousel item containers from the stored (persistent) image URLs.
+  const containerIds: string[] = [];
+  for (let i = 0; i < draft.imageUrls.length; i++) {
+    const id = await createCarouselItem(acct.igUserId, draft.imageUrls[i], acct.pageToken);
+    containerIds.push(id);
+    await ctx.log("slide:container", { index: i + 1, containerId: id });
+  }
+
+  await sleep(10_000);
+  const carouselCaption = `${draft.caption}\n\n${draft.hashtags}`;
+  const carouselId = await createCarouselContainer(acct.igUserId, containerIds, carouselCaption, acct.pageToken);
+  await ctx.log("carousel:created", { carouselId, children: containerIds.length });
+
+  await sleep(10_000);
+  const statusCode = await checkContainerStatus(carouselId, acct.pageToken);
+  await ctx.log("carousel:status", { statusCode });
+
+  if (statusCode !== "FINISHED") {
+    await sendEmail({
+      to: REPORT_RECIPIENT,
+      subject: "CocoGrove carousel failed to publish — media container not ready",
+      html:
+        `<p>The approved CocoGrove carousel container did not finish processing in time.</p>` +
+        `<p><strong>Status:</strong> ${statusCode}</p><p><strong>Container ID:</strong> ${carouselId}</p>` +
+        `<p>Re-run publish in a minute — the draft is still saved.</p>`,
+    });
+    await ctx.log("carousel:failure-alert", { to: REPORT_RECIPIENT, statusCode });
+    return {
+      summary: `CocoGrove carousel NOT published — container status ${statusCode} (draft kept)`,
+      data: { mode: "publish", carouselId, statusCode, published: false },
+    };
+  }
+
+  const mediaId = await publishContainer(acct.igUserId, carouselId, acct.pageToken);
+  const permalink = await getPermalink(mediaId, acct.pageToken);
+  await ctx.log("carousel:published", { mediaId, permalink });
+
+  // Clear the draft so it can't be double-posted.
+  await setState(WORKFLOW_ID, DRAFT_KEY, { ...draft, publishedMediaId: mediaId, publishedAt: new Date().toISOString() });
+
+  await sendEmail({
+    to: REPORT_RECIPIENT,
+    subject: `✅ CocoGrove storytelling carousel published: ${draft.topic}`,
+    html:
+      `<h3>CocoGrove Instagram storytelling carousel published to @${acct.username}</h3>` +
+      `<p><strong>Topic:</strong> ${draft.topic}</p>` +
+      `<p><strong>Caption:</strong><br>${draft.caption}</p>` +
+      `<p><strong>Slides:</strong> ${draft.imageUrls.length}</p>` +
+      `<p><strong>Post:</strong> <a href="${permalink}">${permalink}</a></p>`,
+  });
+  await ctx.log("email:sent", { to: REPORT_RECIPIENT });
+
+  return {
+    summary: `Published CocoGrove storytelling carousel (${draft.imageUrls.length} slides) to @${acct.username}: ${draft.topic}`,
+    data: { mode: "publish", mediaId, permalink, slides: draft.imageUrls.length, published: true },
+  };
+}

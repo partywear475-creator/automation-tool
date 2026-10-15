@@ -12,6 +12,9 @@ interface WF {
 // Handy starter inputs for the form/manual workflows that take a body.
 const SAMPLE_BODY: Record<string, string> = {
   "cocogrove-caption-assistant": '{\n  "dishName": "Kerala prawn roast",\n  "postType": "feed"\n}',
+  // Carousel: generate a draft first (default). To publish the approved draft,
+  // change "generate" to "publish" and run again.
+  "cocogrove-storytelling-carousel": '{\n  "mode": "generate"\n}',
   "nianova-instagram-auto-post": '{\n  "imageUrl": "https://...",\n  "caption": "..."\n}',
   "emberwolf-episode-generator": '{\n  "topic": "...",\n  "pillar": "...",\n  "duration": 30\n}',
 };
